@@ -14,7 +14,7 @@ npm install
 Scrap data from San Jose
 
 ```
-npm run scrap san_jose
+npm run scrap san_jose 2
 ```
 
-NB: notice how we join the name with an _ and all letters are small.
+NB: notice how we join the name with an _ and all letters are small. 2 is an optional field that represents cpu cores your computer can handle, default is 1, use it to speed request but know that you avvo might block you if the requests exhausts the server.

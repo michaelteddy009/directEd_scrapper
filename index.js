@@ -1,464 +1,167 @@
+import { Worker } from 'worker_threads';
+import fs from 'fs';
+import path from 'path';
+import {
+    fetchAttorneyData,
+    getStatesLinks,
+    appendDataListToJsonFile,
+    getUserLinks,
+    getLastPageValue,
+    createJsonFileIfNotExists,
+} from './main.js';  // Import your main functions
 
-const { connect } = require("puppeteer-real-browser")
-const fs = require('fs');
-const path = require('path');
-const { JSDOM } = require('jsdom');
+const maxWorkers = process.argv[3] ?? 1;  // Limit the number of concurrent workers
+const workerPool = [];  // Pool of workers
+let taskQueue = [];  // Queue to hold pending attorney links
 
+// Create workers
+for (let i = 0; i < maxWorkers; i++) {
+    const worker = new Worker('./worker.js');  // Create a worker thread
+    worker.on('message', handleWorkerResponse);
+    worker.on('error', handleWorkerError);
+    worker.busy = false;  // Track if the worker is busy
+    workerPool.push(worker);
+}
 
-function scrapCost(doc)
-{
-    try {
-        const main = doc.querySelector('#payments').outerHTML
-        const dom = new JSDOM(main);
-        const document = dom.window.document;
-        
-        let costs = {}
-        let payments =  document.querySelectorAll('li');
-        payments.forEach((payment, index) => {
-            let val = []
-            let statusEl = payment.querySelectorAll('span')
-            statusEl.forEach(s => val.push(s.textContent.replace(/^\n+|\n+$/g, '')))
-            costs[val[0]] = val[1];
-        });
-    
-        return costs;
-    } catch (error) {
-        return {}
+// Function to create directory if it doesn't exist
+function createDirectoryIfNotExists(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true });
+        console.log(`Created directory: ${dirPath}`);
     }
 }
 
-function scrapLicenses(doc)
-{
-    try {
-        const main = doc.querySelector('.licenses-section').outerHTML;
-        const dom = new JSDOM(main);
-        const document = dom.window.document;
-        
-        let licenses = []
-        let licensesCards =  document.querySelectorAll('.license-card');
-        licensesCards.forEach((card, index) => {
-            let cardDetails = card.querySelectorAll('.section')
-            
-            let c = {}
-            cardDetails.forEach((section, index1) => {
-                if(index1 == 1 || index1 == 2) {
-                    let val = []
-                    let statusEl = section.querySelectorAll('span')
-                    statusEl.forEach(s => val.push(s.textContent.replace(/^\n+|\n+$/g, '')))
-                    c[val[0]] = val[1]
-                } else if(index1 == 3) {
-                    let val = []
-                    let statusEl = section.querySelectorAll('.content > span')
-                    statusEl.forEach(s => val.push(s.textContent.replace(/^\n+|\n+$/g, '')))
-                    c['status'] = val[0];
-                    c['disciplinary'] = val[1]
-                }
-            });
-            licenses.push(c)
-        });
-    
-        return licenses;
-    } catch (error) {
-        return [];
-    }
-}
+// Function to track progress of scraping for each practiceName
+async function trackProgress(state, practiceName) {
+    const progressFilePath = `./trackers/progress.json`;  // Path for progress file
+    let progress = {};
 
-function scrapeUsername(document) {
-    try {
-        return document.querySelector('.lawyer-name').textContent
-    } catch (error) {
-        return ''
-    }
-}
+    // Create directories if they do not exist
+    createDirectoryIfNotExists(path.dirname(progressFilePath));  // Create parent directory
 
-function scrapAddress(document) {
-    try {
-        let result = document.querySelector('.contact-address').textContent
-        return result.replace(/^\n+|\n+$/g, '')
-    } catch (error) {
-        return ''
-    }
-}
-
-function scrapPhones(document) {
-    try {
-        let result = document.querySelector('.contact-phones').textContent
-        return result.replace(/^\n+|\n+$/g, '')
-    } catch (error) {
-        
-    }
-}
-
-function scrapWebsite(document) {
-    try {
-        let result = document.querySelector('.contact-website').textContent
-        return result.replace(/^\n+|\n+$/g, '')
-    } catch (error) {
-        return '';
-    }
-}
-
-function scrapAreasOfPractice(doc) {
-    const main = doc.querySelector('.chart-legend-list').outerHTML;
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    
-    let areas = [];
-    let starRatings = document.querySelectorAll('li');
-    starRatings.forEach((starRating) => {
-        let practice = starRating.querySelector('div').textContent.replace(/^\n+|\n+$/g, '');;
-        let percentage= starRating.querySelector('.chart-legend-percent').textContent.replace(/^\n+|\n+$/g, '');
-        let duration_and_cases = starRating.querySelector('p').textContent.replace(/^\n+|\n+$/g, '')
-
-        areas.push({'practice': practice, 'percentage': percentage, 'duration_and_cases': duration_and_cases});
-    })
-
-    return areas;
-}
-
-function scrapRatings(doc) {
-    const main = doc.querySelector('.reviews-container').outerHTML;
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    let review = {
-        'average': document.querySelector('.overall-review-score').textContent, 
-        'number_of_reviews': document.querySelector('.total-reviews').textContent,
-        'star_ratings': {}
+    // Initialize progress if the file does not exist
+    if (!fs.existsSync(progressFilePath)) {
+        progress[state] = {};
+    } else {
+        progress = JSON.parse(fs.readFileSync(progressFilePath));
     }
 
-    let starRatings = document.querySelectorAll('.review-overall-rating-row');
-    starRatings.forEach((starRating) => {
-        let label = starRating.querySelector('.histogram-rating').innerHTML;
-        let percentage = starRating.querySelector('.histogram-rating-percent').innerHTML
-        review.star_ratings[label] = percentage;
-    })
+    // Ensure the practice is tracked
+    if (!progress[state][practiceName]) {
+        progress[state][practiceName] = { last_page: 0, current_page: 0 };
+    }
 
-    return review;
+    return { progress, currentProgress: progress[state][practiceName] };
 }
 
-function scrapDescription(doc) {
-    const main = doc.querySelector('.about-bio').outerHTML;
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    let des = document.querySelector('p').textContent;
-    return des;
-}
-
-function scrapResumeSection(doc) {
-    const main = doc.querySelector('#resume').outerHTML;
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    data = {};
-    let sections =  document.querySelectorAll('.resume-section');
-    sections.forEach((section, index) => {
-
-        let heading = section.querySelector('h2')
-        
-        if (heading.textContent == 'Associations') {
-            let associations = section.querySelectorAll('ul');
-
-            let userAss = []
-            associations.forEach((assoc, index) => {
-                    let val = []
-                    assoc.querySelectorAll('li').forEach((ass) => val.push(ass.textContent.replace(/^\n+|\n+$/g, '')))
-                    userAss.push(val)
-            })
-            data['associations'] = userAss
-        } else if (heading.textContent == 'Education'){
-            let associations = section.querySelectorAll('ul');
-
-            let userAss = []
-            associations.forEach((assoc, index) => {
-                    let val = []
-                    assoc.querySelectorAll('li').forEach((ass) => val.push(ass.textContent.replace(/^\n+|\n+$/g, '')))
-                    userAss.push(val)
-                
-            })
-            data['Education'] = userAss;
-        } else if (heading.textContent == 'Work Experience'){
-            let associations = section.querySelectorAll('ul');
-
-            let userAss = []
-            associations.forEach((assoc, index) => {
-                    let val = []
-                    assoc.querySelectorAll('li').forEach((ass) => val.push(ass.textContent.replace(/^\n+|\n+$/g, '')))
-                    userAss.push(val)
-                
-            })
-            data['Work Experience'] = userAss;
-        } else if (heading.textContent == 'Honors and Awards'){
-            let associations = section.querySelectorAll('ul');
-
-            let userAss = []
-            associations.forEach((assoc, index) => {
-                    let val = []
-                    assoc.querySelectorAll('li').forEach((ass) => val.push(ass.textContent.replace(/^\n+|\n+$/g, '')))
-                    userAss.push(val)
-                
-            })
-            data['Honors and Awards'] = userAss;
-        } else if (heading.textContent == 'Publications'){
-            let associations = section.querySelectorAll('ul');
-
-            let userAss = []
-            associations.forEach((assoc, index) => {
-                    let val = []
-                    assoc.querySelectorAll('li').forEach((ass) => val.push(ass.textContent.replace(/^\n+|\n+$/g, '')))
-                    userAss.push(val)
-                
-            })
-            data['Publications'] = userAss;
+// Function to run worker for each attorney link
+function assignTaskToWorker(attorneyLink) {
+    return new Promise((resolve, reject) => {
+        const availableWorker = workerPool.find(worker => !worker.busy);
+        if (availableWorker) {
+            availableWorker.busy = true;
+            availableWorker.resolve = resolve;
+            availableWorker.reject = reject;
+            availableWorker.postMessage(attorneyLink);  // Send attorney link to the worker
+        } else {
+            // Add task to the queue if no worker is available
+            taskQueue.push({ attorneyLink, resolve, reject });
         }
-
-    })
-      
-    return data;
-}
-
-async function getPageDocument(url)
-{
-    const { browser, page } = await connect({
-
-        headless: false,
-
-        args: [],
-
-        customConfig: {},
-
-        turnstile: true,
-
-        connectOption: {},
-
-        disableXvfb: false,
-        ignoreAllFlags: false
-        // proxy:{
-        //     host:'<proxy-host>',
-        //     port:'<proxy-port>',
-        //     username:'<proxy-username>',
-        //     password:'<proxy-password>'
-        // }
-
-    })
-
-    let res = await page.goto(url)
-    let contentUnit8Array = await res.content();
-    
-    const uint8Array = new Uint8Array(contentUnit8Array); // Example Uint8Array
-    const decoder = new TextDecoder('utf-8'); // Specify the encoding
-    
-    let htmlString = decoder.decode(uint8Array).replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-    browser.close();
-    
-    // Create a new DOMParser instance
-    const dom = new JSDOM(htmlString);
-    return dom.window.document;
-}
-
-function createJsonFileIfNotExists(directory, fileName, defaultData = {}) {
-    const filePath = path.join(directory, fileName);
-
-    // Check if the directory exists
-    if (!fs.existsSync(directory)) {
-        fs.mkdirSync(directory, { recursive: true }); // Create the directory if it doesn't exist
-    }
-
-    // Check if the file exists
-    if (!fs.existsSync(filePath)) {
-        // Create the file with default data if it doesn't exist
-        fs.writeFileSync(filePath, JSON.stringify(defaultData, null, 2), 'utf8');
-        console.log(`${fileName} created at ${directory}`);
-    } else {
-        console.log(`${fileName} already exists in ${directory}`);
-    }
-}
-
-// Function to scrape data from the HTML string
-async function getLastPageValue(state, practiceName, url) {
-    console.log('getting last page from : ' + url);
-    let doc = await getPageDocument(url);
-    const nav = doc.querySelector('nav.pagination').querySelector('a.last').textContent;
-
-    if (nav) {
-        console.log(`Lastpage for ${state} is set to ${nav}`);
-        return nav
-    } else {
-        console.log(`Failed to fetch lastpage for ${state}:${practiceName}, we will use 500 as default laspage.`)
-        return 500;
-    }
-}
-
-async function getUserLinks(url) 
-{
-    let doc = await getPageDocument(url);
-
-    const main = doc.querySelector('div.organic-results').outerHTML;
-
-    // Use JSDOM to create a new document
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    // Query the document for elements
-    const userCards = document.querySelectorAll('.profile-name');
-
-    // extract links
-    let userLinks = [];
-    userCards.forEach(userCard => {
-        userLinks.push(userCard.querySelector('a').href);
     });
-    
-    return userLinks;
 }
 
-async function fetchAttorneyData(url)
-{
-    console.log(`fetching user url:${url}`);
-    let doc = await getPageDocument(url);
-
-    const main = doc.querySelector('.profile-main').outerHTML;
-
-    // Use JSDOM to create a new document
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    let resumeSecionDetails = scrapResumeSection(doc);
-    let userData = {
-        'name': scrapeUsername(document),
-        'description': scrapDescription(doc),
-        'address': scrapAddress(document),
-        'phones': scrapPhones(document),
-        'website': scrapWebsite(document),
-        'cost': scrapCost(doc),
-        'licenses': scrapLicenses(doc),
-        'ratings': scrapRatings(doc),
-        'areas_of_practice': scrapAreasOfPractice(doc),
-        ...resumeSecionDetails
+// Handle worker responses and assign the next task in the queue
+function handleWorkerResponse(message) {
+    const worker = this;
+    worker.busy = false;  // Mark the worker as available
+    if (message.success) {
+        worker.resolve(message.data);  // Resolve with attorney data
+    } else {
+        worker.reject(new Error(`Failed to fetch data: ${message.error}`));
     }
 
-    return userData;
-}
-
-
-function appendDataListToJsonFile(filePath, newData) 
-{
-    let fileData = [];
-    
-    // Check if the file exists and read it
-    if (fs.existsSync(filePath)) {
-        try {
-            const data = fs.readFileSync(filePath, 'utf8');
-            fileData = JSON.parse(data);
-        } catch (error) {
-            console.error('Error reading or parsing file:', error);
-        }
-    }
-    
-    // Ensure that fileData is an array
-    if (!Array.isArray(fileData)) {
-        fileData = [];
-    }
-    
-    // Append new data to the array
-    for (data of newData) {
-        fileData.push(data)
-        
-    }
-
-    // Write the updated data back to the file
-    try {
-        fs.writeFileSync(filePath, JSON.stringify(fileData, null, 2), 'utf8');
-        console.log('Data successfully appended to the file.');
-    } catch (error) {
-        console.error('Error writing to file:', error);
+    // Assign next task in the queue, if available
+    if (taskQueue.length > 0) {
+        const nextTask = taskQueue.shift();
+        assignTaskToWorker(nextTask.attorneyLink).then(nextTask.resolve).catch(nextTask.reject);
     }
 }
 
-async function scrap(state, practiceName, currUrl)
-{
+// Handle worker errors
+function handleWorkerError(error) {
+    console.error(`Worker error: ${error.message}`);
+}
+
+// Function to scrape data for a state and practice area
+// Function to scrape data for a state and practice area
+async function scrap(state, practiceName, currUrl) {
     createJsonFileIfNotExists(`./storage/${state}/`, `${practiceName}.json`, {});
 
-    // console.log(url);
-    let attorneyDataList = [];
+    const progressFilePath = `./trackers/progress.json`;  // Define the path for the progress file
+    const { progress, currentProgress } = await trackProgress(state, practiceName);
     let lastPage = await getLastPageValue(state, practiceName, currUrl);
-    for (let currPage = 1; currPage <= lastPage; currPage++) {
-        console.log(`page ${currPage} of ${lastPage}`);
-        const url = currPage == 1
-            ? currUrl
-            : `${currUrl}?page=${currPage}`;
+    currentProgress.last_page = lastPage;  // Update last page
+    let attorneyDataList = [];
+
+    // Start scraping from the next page
+    for (let currPage = currentProgress.current_page + 1; currPage <= lastPage; currPage++) {
+        console.log(`Scraping page ${currPage} of ${lastPage}`);
+        const url = currPage === 1 ? currUrl : `${currUrl}?page=${currPage}`;
 
         let attorneyLinks = await getUserLinks(url);
-        console.log(`For url:${url} we will scrap the following attorney's`);
-        console.log(attorneyLinks);
+        console.log(`Scraping attorneys from page: ${url}`);
 
-        // Sequentially scrape each attorney's data
-        for (const attorneyLink of attorneyLinks) {
-            try {
-                let attorneyData = await fetchAttorneyData(attorneyLink);
-                if (attorneyData) {
-                    attorneyDataList.push(attorneyData)
+        // Create worker pool for attorney links
+        let promises = attorneyLinks.map(async (attorneyLink) => await assignTaskToWorker(attorneyLink));
+        const results = await Promise.allSettled(promises);
+
+        results.forEach((result, index) => {
+            if (result.status === 'fulfilled') {
+                console.log(`Promise ${index} resolved with username:`, result.value.name);
+                attorneyDataList.push(result.value);  // Only include successful results
+            } else {
+                console.error(`Promise ${index} rejected with reason:`, result.reason);
+            }
+        });
+
+        // Append results to the JSON file
+        appendDataListToJsonFile(`./storage/${state}/${practiceName}.json`, attorneyDataList);
+        console.log("\n\n\n\n\n\n\n\n\n\n");
+
+        // Update progress in the tracking file
+        currentProgress.current_page = currPage;
+        fs.writeFileSync(progressFilePath, JSON.stringify(progress, null, 2));  // Save progress after each page
+    }
+
+    console.log(`Completed scraping for ${practiceName} in ${state}.`);
+}
+
+
+// Initialization function
+async function init() {
+    try {
+        const args = process.argv;
+        if (args.length < 3) {
+            console.error('Please provide a state argument.');
+            process.exit(1);
+        } else {
+            const state = args[2];
+            let links = await getStatesLinks(state);
+            if (links.length > 0) {
+                for (let i = 0; i < links.length; i++) {
+                    let practice = links[i].split('/');
+                    let practiceName = practice[practice.length - 2];
+                    let url = `https://www.avvo.com${links[i]}`;
+                    await scrap(state, practiceName, url);
                 }
-            } catch (error) {
-                console.error(`Failed to fetch data for ${attorneyLink}:`, error);
+            } else {
+                console.log(`No links found for state: ${state}`);
             }
         }
-        appendDataListToJsonFile(`./storage/${state}/${practiceName}.json`, attorneyDataList)
-        console.log('\n\n\n\n\n\n');
-    }
-
-}
-
-async function getStatesLinks(state) {
-    let doc = await getPageDocument('https://www.avvo.com/find-a-lawyer');
-    console.log(doc.outerHTML);
-
-    const main = doc.querySelector('#js-top-state-link-farm').outerHTML;
-    const dom = new JSDOM(main);
-    const document = dom.window.document;
-
-    let states = {};
-    const statesSection =  document.querySelectorAll('a');
-    statesSection.forEach((state, index) => {
-        states[state.textContent.toLowerCase().split(' ').join('_')] = state.href; 
-
-    })
-    
-    let currentStateUrl = `https://www.avvo.com${states[state]}`;
-    let doc1 = await getPageDocument(currentStateUrl);
-    const main1 = doc1.querySelector('.top-pa-items').outerHTML;
-    const dom1 = new JSDOM(main1);
-    const document1 = dom1.window.document;
-
-    let practiceAreasLinks = [];
-    const practiceAreasList = document1.querySelectorAll('li');
-    practiceAreasList.forEach((pa) => {
-        practiceAreasLinks.push(pa.querySelector('a').href.replace(/^\n+|\n+$/g, '')); 
-    })
-
-    return practiceAreasLinks;
-}
-// 
-async function init() {
-    // Get the command line arguments
-    const args = process.argv;
-
-    // Check if the required argument is provided
-    if (args.length < 3) {
-        console.error('Please provide a required argument.');
-        process.exit(1);
-    } else {
-        const state = args[2]; // Change index as needed
-        let links = await getStatesLinks(state);
-        for (let i = 1; i <= links.length; i++) {
-            let practice = links[i].split('/')
-            let practiceName = practice[practice.length - 2];
-            let url = `https://www.avvo.com${links[i]}`;
-            
-            await scrap(state, practiceName, url);
-        }
+    } catch (error) {
+        console.error('Error during initialization:', error);
     }
 }
 
-init()
+// Start the scraping process
+init();
